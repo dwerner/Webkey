@@ -15,20 +15,23 @@ class User(object):
         self.connlist = []
         self.lock = Condition()
 
-    def closeconns(self):
+    def closeAllConnections(self):
         self.lock.acquire()
         while len(self.connlist):
             self.connlist.pop().close()
         self.lock.notifyAll()
         self.lock.release()
 
-    def appendconn(self, c):
+    def appendUserConnectionn(self, c):
         self.lock.acquire()
         try:
+            #set keepalive on this connection
             c.setsockopt( socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPCNT, 6)
-            c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPIDLE, 180)
-            c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPINTVL, 10)
+            #the following socket options are commented out because they are not supported on MacOS/Win32
+
+            #c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPCNT, 6)
+            #c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPIDLE, 180)
+            #c.setsockopt( socket.SOL_TCP, socket.TCP_KEEPINTVL, 10)
         except Exception as e:
             print "error in setting up keepalive ", e
         self.connlist.append(c)
@@ -37,7 +40,7 @@ class User(object):
         self.lock.notifyAll()
         self.lock.release()
 
-    def getconn(self):
+    def getUserConnection(self):
         exptime = time.time()+10
         self.lock.acquire()
         while len(self.connlist) == 0:
@@ -76,11 +79,11 @@ class UserList(object):
         self.users[name] = u
         Persistence.save()
 
-    def closeconns(self):
+    def closeAllConnections(self):
         for name, user in self.users.iteritems():
-            user.closeconns()
+            user.closeAllConnections()
 
-
+# serialize "users" with username, random id
 class Persistence(object):
     lock = Lock()
 
@@ -109,38 +112,49 @@ class Persistence(object):
             print "Error loading users"
 
 
-users = UserList()
-Persistence.load()
-
-
 class ConnectionThread(Thread):
     def __init__(self,c):
         Thread.__init__(self)
         self.conn = c
+
+    # handle a connection
     def run(self):
-        #print "started phonethread "
+        
+        #Get the first line of request from the socket, so we can identify the type of request
         try:
             firstline = self.conn.recv(4096)
         except:
             self.conn.close()
             return
+        
+        #Legacy?
         firstline = firstline.replace("/remote/", "/")
+
+        #Phone requests
         if firstline.startswith("GET /register_") or firstline.startswith("WEBKEY"):
             self.phoneclient(firstline)
+
+        # Browser requests
         else:
             self.browserclient(firstline)
-
-    def trysendall(self,data):
+      
+    # wrap connection to the browser in a try-except, returning false where an exception is thrown.
+    def trySendAll(self,data):
         try:
             self.conn.sendall(data)
         except:
             return False
         return True
 
+    # handle what we consider to be PHONE connections (device/user connections)
     def phoneclient(self,firstline):
         print "PHONE ", firstline
+
+        #find the position of the first / in "GET /username ..." or "WEBKEY username/random"
         p = firstline.find("/")
         if p == -1: conn.close(); return
+
+        # provide a /register_username route. 
         if firstline.startswith("GET /register_"):
             p = firstline[14:].find("/")+14
             q = firstline[p+1:].find("/")+p+1
@@ -151,98 +165,149 @@ class ConnectionThread(Thread):
             print "register, username = "+username+", random = "+random+ " " ;
 
             if users.get(username):
-                self.trysendall("HTTP/1.1 200 OK\r\n\r\nUsername is already used.")
+                self.trySendAll("HTTP/1.1 200 OK\r\n\r\nUsername is already used.")
             else:
                 users.add(username, random)
-                self.trysendall("HTTP/1.1 200 OK\r\n\r\nOK")
+                self.trySendAll("HTTP/1.1 200 OK\r\n\r\nOK")
             self.conn.close()
-            return
 
-
-        username = firstline[7:p]
-        q = firstline[p+1:].find("/")+p+1
-        g = firstline[q+1:].find("/")+q+1
-        e = firstline[g+1:].find("\r") + g+1
-        random = firstline[p+1:q]
-        port = firstline[g+1:e]
-
-        print "username from phone =",username
-        if users.get(username) and users.get(username).random == random:
-            users.get(username).appendconn(self.conn)
-            return
+        #otherwise, we have a "WEBKEY username/random" type of request. This is extending HTTP... :S
         else:
-            print "Wrong username or random"
-            self.trysendall("stop")
-            self.conn.close();
-            return
 
+          #parse out fields from the request : username, random, port
+          username = firstline[7:p] # as in "WEBKEY "...
+          q = firstline[p+1:].find("/")+p+1
+          g = firstline[q+1:].find("/")+q+1
+          e = firstline[g+1:].find("\r") + g+1
+
+          random = firstline[p+1:q]
+          port = firstline[g+1:e]
+
+          print "username from phone =",username
+
+          #Important - store the socket connections in a UserList for later use.
+          if users.get(username) and users.get(username).random == random:
+              users.get(username).appendUserConnectionn(self.conn)
+          else:
+              #But... if we don't have the correct username or "random" then we close the connection. 
+              print "Wrong username or random"
+              self.trySendAll("stop")
+              self.conn.close();
+
+    # Handle requests determined to be from the client browser
     def browserclient(self,firstline):
         print "BROWSER ", firstline[:firstline.find("\r\n")]
         u = None
+
+        #Find the request verb. i.e. GET
         req = firstline[:firstline.find(' ')]
+
         print "REQ is", req, len(req)
+
+        # Find the position of the / AFTER "GET /"
         p = firstline[len(req)+2:].find("/")
+
+        #Also find the first space AFTER "GET /"
         s = firstline[len(req)+2:].find(" ")
+        
+        #determining the location of the second /, and the space lets us
+        # determine if this is a "GET /username/sotherOtherThing/ ..." (Type A)
+        # or a "GET /username ..." (Type B) type of request 
         if s < p:
             p = s
         print "P is ", p
+
+        #Always fish out the username from "GET /username..."
         username = firstline[len(req) + 2:p+len(req)+2]
         print "Username:", username
-        u = users.get(username)
 
+        #Check for an active connection to that username:
+        u = users.get(username)
         if u == None:
-            self.trysendall("HTTP/1.1 404 Not Found\r\n\r\nPhone is unknown\r\n")
+            self.trySendAll("HTTP/1.1 404 Not Found\r\n\r\nPhone is unknown\r\n")
             self.conn.close()
             return
 
+        #Rewrite the request as "GET /username..." => "GET /..."
         data = req + " " + firstline[p+len(req)+2:]
         print "REWRITTEN as", data[:data.find("\r\n")]
         data2 = ""
         while 1:
             e = data.find("\r\n\r\n")
             if e != -1:
+
+                #Chop the request into two parts:
+                # Part 2 (data2): everything after the first occurance of two consecutive newlines
+                # Part 1 (data): everything up to the first two consecutive newlines \r\n\r\n
                 data2 = data[e+4:]
                 data = data[:e+4]
+
+                #break the loop!
                 break
+
+            #later check the length of data to validate a socket read
             dl = len(data)
             try:
+                #if we didnt find two consecutive newlines in the above loop
+                # then we might need to recieve more data from the socket
+                # buffer 4096 bytes into -data
                 data += self.conn.recv(4096)
             except:
                 self.conn.close()
                 return
+            # if we couldnt read up to another \r\n\r\n, then we want to close the probably bad connection
             if dl == len(data):
                 #print data
                 print "no endline, exiting"
                 self.conn.close()
                 return;
-            #print [ord(s) for s in data[-4:]]
+
+        #if there is a Content-Length header in the data, we can use that to buffer the correct amount 
         p = data.find("Content-Length:")
         if p != -1:
+          
+            #magic? magic numbers.... yeesh
             i = p+16
+
+            # ...finding the location of the end of a range of digits
             while i < len(data) and '0' <= data[i] <= '9':
                 i+=1;
+
+            #clamp the count of the start (magic number) to the end (i) with min to 33554432 (32*1024*1024)
             cl = int(data[p+16:i])
             cl = min(cl,32*1024*1024) #There is a limit
             while 1:
+
+                #again storing the size of our existing response
                 dl = len(data2)
+                
                 if len(data2) >= cl:
                     break
                 try:
+                    #buffer into data2 with 4096 byte chunks
                     data2 += self.conn.recv(4096)
                 except:
                     return
+
+                #if we didn't get anything, then the connection's probably bad
                 if dl == len(data2):
                     self.conn.close()
                     return
+
+        #add all the data retrieved from the response back into one place
         data += data2
+
+        #but if we didn't find any data, then close the connection, again
         if not data:
             self.conn.close()
             return
+
+        # send all data to the user connection
         c=None
         while 1:
-            c = u.getconn()
+            c = u.getUserConnection()
             if c == None:
-                self.trysendall("HTTP/1.1 404 Not Found\r\n\r\nPhone is not online\r\n")
+                self.trySendAll("HTTP/1.1 404 Not Found\r\n\r\nPhone is not online\r\n")
                 self.conn.close()
                 return
             try:
@@ -251,6 +316,8 @@ class ConnectionThread(Thread):
             except:
                 print "sendall error"
                 c.close()
+
+        # stream all data through the other connection (browser) 
         s = 0
         while 1:
             data = None
@@ -258,37 +325,50 @@ class ConnectionThread(Thread):
                 data = c.recv(4096)
                 s += len(data)
                 if not data: break
-                self.trysendall(data)
+                self.trySendAll(data)
             except:
                 break
+
+        #finally clean up if we reach here
+
+        #close the browser connection
         self.conn.close()
+
+        #close the device (user) connection
         c.close()
 
+
+# Main entry point of Script 
+users = UserList()
+Persistence.load()
 
 HOST = ''
 PORT = 9934
 if len(sys.argv) > 1:
     try:
-        PORT = int(sys.argv[1])
+        PORT = int(sys.argv[1]) # optionally pass PORT to this script from the command line
     except:
         pass
 
+#Bind a socket to listen to HOST and PORT above
 clientsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 clientsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-clientsock.bind((HOST, PORT))
-clientsock.listen(9500)
+
+clientsock.bind((HOST, PORT)) # should we also be 'listen'ing as below?
+
+clientsock.listen(9500) #unknown if this is used.
+
 print "server started"
 
 while 1:
     try:
         conn, addr = clientsock.accept()
         print 'Connected by', addr
-#        conn.setsockopt( socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack('ii',30,0))
         ConnectionThread(conn).start()
-        #print i
+
     except KeyboardInterrupt:
         try:
-            f.close()
+            clientsock.close() 
         except:
             pass
         break
@@ -300,4 +380,4 @@ print "stopping"
 clientsock.shutdown(socket.SHUT_RDWR)
 clientsock.close()
 
-users.closeconns()
+users.closeAllConnections()
